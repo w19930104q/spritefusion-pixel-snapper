@@ -5,7 +5,6 @@ use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, WeightedIndex};
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-use std::cmp::Ordering;
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::env;
@@ -13,6 +12,11 @@ use std::error::Error;
 use std::fmt;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
+
+mod grid;
+mod sha256;
+
+pub use grid::{AxisStats, Candidate, DetectionParams, GridReport, GridVerdict};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -33,14 +37,9 @@ pub struct Config {
     #[allow(dead_code)]
     output_path: String,
     max_kmeans_iterations: usize,
-    peak_threshold_multiplier: f64,
-    peak_distance_filter: usize,
-    walker_search_window_ratio: f64,
-    walker_min_search_window: f64,
-    walker_strength_threshold: f64,
-    min_cuts_per_axis: usize,
-    fallback_target_segments: usize,
-    max_step_ratio: f64,
+    /// When set, the CLI writes a deterministic JSON detection report here.
+    #[cfg(not(target_arch = "wasm32"))]
+    report_path: Option<String>,
 }
 
 impl Default for Config {
@@ -51,16 +50,10 @@ impl Default for Config {
             input_path: "samples/2/skeleton.png".to_string(),
             output_path: "samples/2/skeleton_fixed_clean2.png".to_string(),
             max_kmeans_iterations: 15,
-            peak_threshold_multiplier: 0.2,
-            peak_distance_filter: 4,
-            walker_search_window_ratio: 0.35,
-            walker_min_search_window: 2.0,
-            walker_strength_threshold: 0.5,
-            min_cuts_per_axis: 4,
-            fallback_target_segments: 64,
-            max_step_ratio: 1.8, // Lowered from 3.0 to catch more skew cases
             pixel_size_override: None,
             palette: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            report_path: None,
         }
     }
 }
@@ -99,13 +92,36 @@ impl From<PixelSnapperError> for wasm_bindgen::JsValue {
 
 pub type Result<T> = std::result::Result<T, PixelSnapperError>;
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-struct ProcessedImage {
+/// Everything produced by one deterministic pipeline run.
+pub struct ProcessedImage {
     output_bytes: Vec<u8>,
-    pixel_size: f64,
+    report: GridReport,
     pixel_size_override: bool,
-    output_width: u32,
-    output_height: u32,
+    input_width: u32,
+    input_height: u32,
+    output_sha256: String,
+}
+
+impl ProcessedImage {
+    pub fn output_bytes(&self) -> &[u8] {
+        &self.output_bytes
+    }
+
+    pub fn report(&self) -> &GridReport {
+        &self.report
+    }
+
+    pub fn output_sha256(&self) -> &str {
+        &self.output_sha256
+    }
+
+    pub fn input_dimensions(&self) -> (u32, u32) {
+        (self.input_width, self.input_height)
+    }
+
+    pub fn is_pixel_size_override(&self) -> bool {
+        self.pixel_size_override
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -227,18 +243,26 @@ fn print_cli_help() {
             "OPTIONS:\n",
             "  --pixel-size <PIXELS>  Override the auto-detected pixel size\n",
             "  --palette <HEX,...>    Use comma-separated 6-digit hex palette colors\n",
+            "  --report <FILE>        Write a deterministic JSON detection report\n",
             "  -h, --help             Print help\n",
             "  -V, --version          Print version\n\n",
             "EXAMPLES:\n",
             "  spritefusion-pixel-snapper input.png output.png\n",
             "  spritefusion-pixel-snapper input.png output.png 16 --pixel-size 8\n",
-            "  spritefusion-pixel-snapper inputs outputs --palette 0d2b45,ffecd6"
+            "  spritefusion-pixel-snapper inputs outputs --palette 0d2b45,ffecd6\n",
+            "  spritefusion-pixel-snapper input.png output.png --report report.json"
         ),
         version = env!("CARGO_PKG_VERSION")
     );
 }
 
-fn process_image_common(input_bytes: &[u8], config: Option<Config>) -> Result<ProcessedImage> {
+/// Analyze and transform raw image bytes.
+///
+/// Deterministic pipeline: k-means quantization (seeded) → gradient profiles →
+/// autocorrelation pitch scoring → harmonic candidate pruning → confidence and
+/// no-grid gate → uniform cut transform → majority-vote resample → optional
+/// palette remap → PNG encode.
+pub fn process_image_common(input_bytes: &[u8], config: Option<Config>) -> Result<ProcessedImage> {
     let config = config.unwrap_or_default();
 
     let img = image::load_from_memory(input_bytes)?;
@@ -257,50 +281,70 @@ fn process_image_common(input_bytes: &[u8], config: Option<Config>) -> Result<Pr
     }
 
     let rgba_img = img.to_rgba8();
-
     let analysis_img = quantize_image(&rgba_img, &config)?;
-    let (profile_x, profile_y) = compute_profiles(&analysis_img)?;
 
-    // Estimate step sizes
-    let step_x_opt = estimate_step_size(&profile_x, &config);
-    let step_y_opt = estimate_step_size(&profile_y, &config);
+    let params = DetectionParams::default();
+    let (profile_x, profile_y) = grid::compute_profiles(&analysis_img);
 
-    // Resolve step sizes. Some instabilities so use sibling axis if one fails, or fallback if both fail
-    let (step_x, step_y) = resolve_step_sizes(step_x_opt, step_y_opt, width, height, &config);
+    let detection = match config.pixel_size_override {
+        Some(px) => grid::override_detection(
+            &profile_x,
+            &profile_y,
+            width as usize,
+            height as usize,
+            px,
+            &params,
+        ),
+        None => grid::detect(
+            &profile_x,
+            &profile_y,
+            width as usize,
+            height as usize,
+            &params,
+        ),
+    };
 
-    let raw_col_cuts = walk(&profile_x, step_x, width as usize, &config)?;
-    let raw_row_cuts = walk(&profile_y, step_y, height as usize, &config)?;
+    // No-grid inputs use a true identity transform: re-encode the original
+    // (unquantized) pixels as PNG, so the output dimensions and pixels match
+    // the input exactly — unless the caller explicitly forces a palette.
+    if detection.report.verdict == GridVerdict::NoGrid && config.palette.is_none() {
+        let mut output_bytes = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut output_bytes);
+        rgba_img
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(PixelSnapperError::ImageError)?;
+        let output_sha256 = sha256::sha256_hex(&output_bytes);
+        return Ok(ProcessedImage {
+            output_bytes,
+            report: detection.report,
+            pixel_size_override: false,
+            input_width: width,
+            input_height: height,
+            output_sha256,
+        });
+    }
 
-    // Two-pass stabilization: first pass with raw cuts, then cross-validate
-    let (col_cuts, row_cuts) = stabilize_both_axes(
-        &profile_x,
-        &profile_y,
-        raw_col_cuts,
-        raw_row_cuts,
-        width as usize,
-        height as usize,
-        &config,
-    );
-
-    let snapped_img = resample(&analysis_img, &col_cuts, &row_cuts)?;
+    let snapped_img = resample(&analysis_img, &detection.col_cuts, &detection.row_cuts)?;
     let output_img = match config.palette.as_deref() {
         Some(palette) => apply_palette(&snapped_img, palette)?,
         None => snapped_img,
     };
 
-    // Returns bytes for both implementations
     let mut output_bytes = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut output_bytes);
     output_img
         .write_to(&mut cursor, image::ImageFormat::Png)
         .map_err(PixelSnapperError::ImageError)?;
 
+    let output_sha256 = sha256::sha256_hex(&output_bytes);
+
     Ok(ProcessedImage {
         output_bytes,
-        pixel_size: step_x,
+        report: detection.report,
         pixel_size_override: config.pixel_size_override.is_some(),
-        output_width: (col_cuts.len() - 1) as u32,
-        output_height: (row_cuts.len() - 1) as u32,
+        input_width: width,
+        input_height: height,
+        output_sha256,
     })
 }
 
@@ -394,6 +438,15 @@ fn parse_cli_args(args: &[String]) -> Result<CliCommand> {
                 config.palette = Some(parse_palette_hex(val)?);
                 i += 2;
             }
+            "--report" => {
+                let Some(val) = args.get(i + 1) else {
+                    return Err(PixelSnapperError::InvalidInput(
+                        "--report requires a value".to_string(),
+                    ));
+                };
+                config.report_path = Some(val.clone());
+                i += 2;
+            }
             arg if arg.starts_with("--") => {
                 return Err(PixelSnapperError::InvalidInput(format!(
                     "unknown argument '{}'",
@@ -423,6 +476,11 @@ fn parse_cli_args(args: &[String]) -> Result<CliCommand> {
 fn process(config: &Config) -> Result<()> {
     let input_path = Path::new(&config.input_path);
     if input_path.is_dir() {
+        if config.report_path.is_some() {
+            return Err(PixelSnapperError::InvalidInput(
+                "--report is only supported for single-file inputs".to_string(),
+            ));
+        }
         process_batch(config)
     } else {
         process_single(config)
@@ -436,12 +494,24 @@ fn process_single(config: &Config) -> Result<()> {
     let output_path = Path::new(&config.output_path);
     let processed = process_file(input_path, output_path, config)?;
     println!("Processing: {}", config.input_path);
-    print_processed_image(
-        processed.pixel_size,
-        processed.pixel_size_override,
-        processed.output_width,
-        processed.output_height,
-    );
+    print_processed_image(&processed);
+    if let Some(report_path) = &config.report_path {
+        let json = report_to_json(
+            &processed.report,
+            &config.input_path,
+            &config.output_path,
+            processed.input_width,
+            processed.input_height,
+            &processed.output_sha256,
+        );
+        std::fs::write(report_path, json).map_err(|e| {
+            PixelSnapperError::ProcessingError(format!(
+                "Failed to write report '{}': {}",
+                report_path, e
+            ))
+        })?;
+        println!("Report: {}", report_path);
+    }
     println!("Saved to: {}", config.output_path);
     Ok(())
 }
@@ -634,22 +704,158 @@ fn process_file(input_path: &Path, output_path: &Path, config: &Config) -> Resul
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn print_processed_image(
-    pixel_size: f64,
-    pixel_size_override: bool,
-    output_width: u32,
-    output_height: u32,
-) {
-    println!(
-        "Pixel size: {:.1}px ({})",
-        pixel_size,
-        if pixel_size_override {
-            "override"
-        } else {
-            "auto-detected"
+fn print_processed_image(processed: &ProcessedImage) {
+    let report = &processed.report;
+    match report.verdict {
+        GridVerdict::NoGrid => {
+            println!("Grid: none detected (identity transform)");
+            println!(
+                "Confidence: 0.000 (best score {:.3}, margin {:.3}, signal {:.3})",
+                report.best_score, report.margin, report.signal
+            );
         }
+        GridVerdict::Detected | GridVerdict::Override => {
+            let mode = if processed.pixel_size_override {
+                "override"
+            } else {
+                "auto-detected"
+            };
+            println!("Pixel size: {:.1}px ({})", report.pixel_size, mode);
+            println!(
+                "Confidence: {:.3} (score {:.3}, margin {:.3}, signal {:.3})",
+                report.confidence, report.best_score, report.margin, report.signal
+            );
+            println!(
+                "Scale: {:.4}x (x), {:.4}x (y)",
+                report.scale_x(processed.input_width),
+                report.scale_y(processed.input_height)
+            );
+        }
+    }
+    println!(
+        "Output size: {}x{}",
+        report.output_width, report.output_height
     );
-    println!("Output size: {}x{}", output_width, output_height);
+    println!("Output SHA-256: {}", processed.output_sha256);
+}
+
+/// Deterministic JSON serialization of a detection report (no serde dependency).
+///
+/// Field order is fixed and all floats use a fixed precision, so identical
+/// inputs always produce byte-identical report files.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::format_push_string)]
+pub fn report_to_json(
+    report: &GridReport,
+    input_path: &str,
+    output_path: &str,
+    input_width: u32,
+    input_height: u32,
+    output_sha256: &str,
+) -> String {
+    let verdict = match report.verdict {
+        GridVerdict::Detected => "detected",
+        GridVerdict::NoGrid => "no_grid",
+        GridVerdict::Override => "override",
+    };
+    let mut s = String::new();
+    s.push_str("{\n");
+    s.push_str(&format!("  \"verdict\": \"{}\",\n", verdict));
+    s.push_str(&format!("  \"input\": \"{}\",\n", json_escape(input_path)));
+    s.push_str(&format!(
+        "  \"output\": \"{}\",\n",
+        json_escape(output_path)
+    ));
+    s.push_str(&format!(
+        "  \"input_size\": [{}, {}],\n",
+        input_width, input_height
+    ));
+    s.push_str(&format!(
+        "  \"output_size\": [{}, {}],\n",
+        report.output_width, report.output_height
+    ));
+    s.push_str(&format!(
+        "  \"scale\": [{}, {}],\n",
+        fmt_f64(report.scale_x(input_width)),
+        fmt_f64(report.scale_y(input_height))
+    ));
+    s.push_str(&format!("  \"pitch\": {},\n", report.pitch));
+    s.push_str(&format!(
+        "  \"pixel_size\": {},\n",
+        fmt_f64(report.pixel_size)
+    ));
+    s.push_str(&format!(
+        "  \"confidence\": {},\n",
+        fmt_f64(report.confidence)
+    ));
+    s.push_str(&format!("  \"signal\": {},\n", fmt_f64(report.signal)));
+    s.push_str(&format!("  \"margin\": {},\n", fmt_f64(report.margin)));
+    s.push_str(&format!(
+        "  \"best_score\": {},\n",
+        fmt_f64(report.best_score)
+    ));
+    s.push_str(&format!("  \"output_sha256\": \"{}\",\n", output_sha256));
+    s.push_str(&axis_stats_json("stats_x", &report.stats_x, true));
+    s.push_str(&axis_stats_json("stats_y", &report.stats_y, true));
+    s.push_str("  \"candidates\": [");
+    if report.candidates.is_empty() {
+        s.push_str("]\n");
+    } else {
+        s.push('\n');
+        for (i, candidate) in report.candidates.iter().enumerate() {
+            s.push_str("    {");
+            s.push_str(&format!("\"pitch\": {}", candidate.pitch));
+            s.push_str(&format!(", \"score\": {}", fmt_f64(candidate.score)));
+            s.push_str(&format!(", \"score_x\": {}", fmt_f64(candidate.score_x)));
+            s.push_str(&format!(", \"score_y\": {}", fmt_f64(candidate.score_y)));
+            s.push('}');
+            if i + 1 < report.candidates.len() {
+                s.push(',');
+            }
+            s.push('\n');
+        }
+        s.push_str("  ]\n");
+    }
+    s.push_str("}\n");
+    s
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn axis_stats_json(name: &str, stats: &AxisStats, trailing_comma: bool) -> String {
+    format!(
+        "  \"{}\": {{\"mean_over_max\": {}, \"peak_fraction\": {}, \"energy\": {}}}{}\n",
+        name,
+        fmt_f64(stats.mean_over_max),
+        fmt_f64(stats.peak_fraction),
+        fmt_f64(stats.energy),
+        if trailing_comma { "," } else { "" }
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fmt_f64(value: f64) -> String {
+    if value.is_finite() {
+        format!("{:.6}", value)
+    } else {
+        "null".to_string()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn json_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -936,412 +1142,10 @@ fn apply_palette(img: &RgbaImage, palette: &[[u8; 3]]) -> Result<RgbaImage> {
     Ok(recolored_img)
 }
 
-fn compute_profiles(img: &RgbaImage) -> Result<(Vec<f64>, Vec<f64>)> {
-    let (w, h) = img.dimensions();
-
-    if w < 3 || h < 3 {
-        return Err(PixelSnapperError::InvalidInput(
-            "Image too small (minimum 3x3)".to_string(),
-        ));
-    }
-
-    let mut col_proj = vec![0.0; w as usize];
-    let mut row_proj = vec![0.0; h as usize];
-
-    let gray = |x, y| {
-        let p = img.get_pixel(x, y);
-        if p[3] == 0 {
-            0.0
-        } else {
-            0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64
-        }
-    };
-
-    // kernels: [-1, 0, 1]
-    for y in 0..h {
-        for x in 1..w - 1 {
-            let left = gray(x - 1, y);
-            let right = gray(x + 1, y);
-            let grad = (right - left).abs();
-            col_proj[x as usize] += grad;
-        }
-    }
-    for x in 0..w {
-        for y in 1..h - 1 {
-            let top = gray(x, y - 1);
-            let bottom = gray(x, y + 1);
-            let grad = (bottom - top).abs();
-            row_proj[y as usize] += grad;
-        }
-    }
-
-    Ok((col_proj, row_proj))
-}
-
-fn estimate_step_size(profile: &[f64], config: &Config) -> Option<f64> {
-    if profile.is_empty() {
-        return None;
-    }
-
-    let max_val = profile.iter().cloned().fold(f64::NAN, f64::max);
-    if max_val == 0.0 {
-        return None; // Decide later
-    }
-    let threshold = max_val * config.peak_threshold_multiplier;
-
-    let mut peaks = Vec::new();
-    for i in 1..profile.len() - 1 {
-        if profile[i] > threshold && profile[i] > profile[i - 1] && profile[i] > profile[i + 1] {
-            peaks.push(i);
-        }
-    }
-
-    if peaks.len() < 2 {
-        return None;
-    }
-
-    let mut clean_peaks = vec![peaks[0]];
-    for &p in peaks.iter().skip(1) {
-        if p - clean_peaks.last().unwrap() > (config.peak_distance_filter - 1) {
-            clean_peaks.push(p);
-        }
-    }
-
-    if clean_peaks.len() < 2 {
-        return None;
-    }
-
-    // Compute diffs
-    let mut diffs: Vec<f64> = clean_peaks
-        .windows(2)
-        .map(|w| (w[1] - w[0]) as f64)
-        .collect();
-
-    // Median
-    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    Some(diffs[diffs.len() / 2])
-}
-
-fn resolve_step_sizes(
-    step_x_opt: Option<f64>,
-    step_y_opt: Option<f64>,
-    width: u32,
-    height: u32,
-    config: &Config,
-) -> (f64, f64) {
-    if let Some(px) = config.pixel_size_override {
-        return (px, px);
-    }
-
-    match (step_x_opt, step_y_opt) {
-        (Some(sx), Some(sy)) => {
-            let ratio = if sx > sy { sx / sy } else { sy / sx };
-            if ratio > config.max_step_ratio {
-                let smaller = sx.min(sy);
-                (smaller, smaller)
-            } else {
-                let avg = (sx + sy) / 2.0;
-                (avg, avg)
-            }
-        }
-
-        (Some(sx), None) => (sx, sx),
-
-        (None, Some(sy)) => (sy, sy),
-
-        (None, None) => {
-            let fallback_step =
-                ((width.min(height) as f64) / config.fallback_target_segments as f64).max(1.0);
-            (fallback_step, fallback_step)
-        }
-    }
-}
-
-fn stabilize_both_axes(
-    profile_x: &[f64],
-    profile_y: &[f64],
-    raw_col_cuts: Vec<usize>,
-    raw_row_cuts: Vec<usize>,
-    width: usize,
-    height: usize,
-    config: &Config,
-) -> (Vec<usize>, Vec<usize>) {
-    let col_cuts_pass1 = stabilize_cuts(
-        profile_x,
-        raw_col_cuts.clone(),
-        width,
-        &raw_row_cuts,
-        height,
-        config,
-    );
-    let row_cuts_pass1 = stabilize_cuts(
-        profile_y,
-        raw_row_cuts.clone(),
-        height,
-        &raw_col_cuts,
-        width,
-        config,
-    );
-
-    // Check if the results are coherent
-    let col_cells = col_cuts_pass1.len().saturating_sub(1).max(1);
-    let row_cells = row_cuts_pass1.len().saturating_sub(1).max(1);
-    let col_step = width as f64 / col_cells as f64;
-    let row_step = height as f64 / row_cells as f64;
-
-    let step_ratio = if col_step > row_step {
-        col_step / row_step
-    } else {
-        row_step / col_step
-    };
-
-    if step_ratio > config.max_step_ratio {
-        let target_step = col_step.min(row_step);
-
-        let final_col_cuts = if col_step > target_step * 1.2 {
-            snap_uniform_cuts(
-                profile_x,
-                width,
-                target_step,
-                config,
-                config.min_cuts_per_axis,
-            )
-        } else {
-            col_cuts_pass1
-        };
-
-        let final_row_cuts = if row_step > target_step * 1.2 {
-            snap_uniform_cuts(
-                profile_y,
-                height,
-                target_step,
-                config,
-                config.min_cuts_per_axis,
-            )
-        } else {
-            row_cuts_pass1
-        };
-
-        (final_col_cuts, final_row_cuts)
-    } else {
-        (col_cuts_pass1, row_cuts_pass1)
-    }
-}
-
-// Tried uniform grid instead of an elastic-ish walker, but the result was a bit worse.
-// Keeping the walker for now. But some distortions might happen...
-fn walk(profile: &[f64], step_size: f64, limit: usize, config: &Config) -> Result<Vec<usize>> {
-    if profile.is_empty() {
-        return Err(PixelSnapperError::ProcessingError(
-            "Cannot walk on empty profile".to_string(),
-        ));
-    }
-
-    let mut cuts = vec![0];
-    let mut current_pos = 0.0;
-    let search_window =
-        (step_size * config.walker_search_window_ratio).max(config.walker_min_search_window);
-    let mean_val: f64 = profile.iter().sum::<f64>() / profile.len() as f64;
-
-    while current_pos < limit as f64 {
-        let target = current_pos + step_size;
-        if target >= limit as f64 {
-            cuts.push(limit);
-            break;
-        }
-
-        let start_search = ((target - search_window) as usize).max((current_pos + 1.0) as usize);
-        let end_search = ((target + search_window) as usize).min(limit);
-
-        if end_search <= start_search {
-            current_pos = target;
-            continue;
-        }
-
-        let mut max_val = -1.0;
-        let mut max_idx = start_search;
-        for (i, &value) in profile
-            .iter()
-            .enumerate()
-            .take(end_search)
-            .skip(start_search)
-        {
-            if value > max_val {
-                max_val = value;
-                max_idx = i;
-            }
-        }
-
-        if max_val > mean_val * config.walker_strength_threshold {
-            cuts.push(max_idx);
-            current_pos = max_idx as f64;
-        } else {
-            cuts.push(target as usize);
-            current_pos = target;
-        }
-    }
-    Ok(cuts)
-}
-
-fn stabilize_cuts(
-    profile: &[f64],
-    cuts: Vec<usize>,
-    limit: usize,
-    sibling_cuts: &[usize],
-    sibling_limit: usize,
-    config: &Config,
-) -> Vec<usize> {
-    if limit == 0 {
-        return vec![0];
-    }
-
-    let cuts = sanitize_cuts(cuts, limit);
-    let min_required = config.min_cuts_per_axis.max(2).min(limit.saturating_add(1));
-    let axis_cells = cuts.len().saturating_sub(1);
-    let sibling_cells = sibling_cuts.len().saturating_sub(1);
-    let sibling_has_grid =
-        sibling_limit > 0 && sibling_cells >= min_required.saturating_sub(1) && sibling_cells > 0;
-    let steps_skewed = sibling_has_grid && axis_cells > 0 && {
-        let axis_step = limit as f64 / axis_cells as f64;
-        let sibling_step = sibling_limit as f64 / sibling_cells as f64;
-        let step_ratio = axis_step / sibling_step;
-        step_ratio > config.max_step_ratio || step_ratio < 1.0 / config.max_step_ratio
-    };
-    let has_enough = cuts.len() >= min_required;
-
-    if has_enough && !steps_skewed {
-        return cuts;
-    }
-
-    let mut target_step = if sibling_has_grid {
-        sibling_limit as f64 / sibling_cells as f64
-    } else if config.fallback_target_segments > 1 {
-        limit as f64 / config.fallback_target_segments as f64
-    } else if axis_cells > 0 {
-        limit as f64 / axis_cells as f64
-    } else {
-        limit as f64
-    };
-    if !target_step.is_finite() || target_step <= 0.0 {
-        target_step = 1.0;
-    }
-
-    snap_uniform_cuts(profile, limit, target_step, config, min_required)
-}
-
-fn sanitize_cuts(mut cuts: Vec<usize>, limit: usize) -> Vec<usize> {
-    if limit == 0 {
-        return vec![0];
-    }
-
-    let mut has_zero = false;
-    let mut has_limit = false;
-
-    for value in cuts.iter_mut() {
-        if *value == 0 {
-            has_zero = true;
-        }
-        if *value >= limit {
-            *value = limit;
-        }
-        if *value == limit {
-            has_limit = true;
-        }
-    }
-
-    if !has_zero {
-        cuts.push(0);
-    }
-    if !has_limit {
-        cuts.push(limit);
-    }
-
-    cuts.sort_unstable();
-    cuts.dedup();
-    cuts
-}
-
-fn snap_uniform_cuts(
-    profile: &[f64],
-    limit: usize,
-    target_step: f64,
-    config: &Config,
-    min_required: usize,
-) -> Vec<usize> {
-    if limit == 0 {
-        return vec![0];
-    }
-    if limit == 1 {
-        return vec![0, 1];
-    }
-
-    // Get desired cells
-    let mut desired_cells = if target_step.is_finite() && target_step > 0.0 {
-        (limit as f64 / target_step).round() as usize
-    } else {
-        0
-    };
-    desired_cells = desired_cells
-        .max(min_required.saturating_sub(1))
-        .max(1)
-        .min(limit);
-
-    let cell_width = limit as f64 / desired_cells as f64;
-    let search_window =
-        (cell_width * config.walker_search_window_ratio).max(config.walker_min_search_window);
-    let mean_val = if profile.is_empty() {
-        0.0
-    } else {
-        profile.iter().sum::<f64>() / profile.len() as f64
-    };
-
-    let mut cuts = Vec::with_capacity(desired_cells + 1);
-    cuts.push(0);
-    for idx in 1..desired_cells {
-        let target = cell_width * idx as f64;
-        let prev = *cuts.last().unwrap();
-        if prev + 1 >= limit {
-            break;
-        }
-        let mut start = ((target - search_window).floor() as isize)
-            .max(prev as isize + 1)
-            .max(0);
-        let mut end = ((target + search_window).ceil() as isize).min(limit as isize - 1);
-        if end < start {
-            start = prev as isize + 1;
-            end = start;
-        }
-        let start = start as usize;
-        let end = end as usize;
-        let mut best_idx = start.min(profile.len().saturating_sub(1));
-        let mut best_val = -1.0;
-        for i in start..=end.min(profile.len().saturating_sub(1)) {
-            let v = profile.get(i).copied().unwrap_or(0.0);
-            if v > best_val {
-                best_val = v;
-                best_idx = i;
-            }
-        }
-        let strength_threshold = mean_val * config.walker_strength_threshold;
-        if best_val < strength_threshold {
-            let mut fallback_idx = target.round() as isize;
-            if fallback_idx <= prev as isize {
-                fallback_idx = prev as isize + 1;
-            }
-            if fallback_idx >= limit as isize {
-                fallback_idx = (limit as isize - 1).max(prev as isize + 1);
-            }
-            best_idx = fallback_idx as usize;
-        }
-        cuts.push(best_idx);
-    }
-    if *cuts.last().unwrap() != limit {
-        cuts.push(limit);
-    }
-    cuts = sanitize_cuts(cuts, limit);
-    cuts
-}
-
+/// Resample each cut cell to one output pixel via deterministic majority vote.
+///
+/// Ties resolve by the RGBA tuple's lexicographic order — never by hash-map
+/// iteration order — so identical inputs produce byte-identical outputs.
 fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize]) -> Result<RgbaImage> {
     if cols.len() < 2 || rows.len() < 2 {
         return Err(PixelSnapperError::ProcessingError(
@@ -1375,19 +1179,12 @@ fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize]) -> Result<RgbaImage
             }
 
             let mut best_pixel = [0, 0, 0, 0];
-
-            let mut candidates: Vec<([u8; 4], usize)> = counts.into_iter().collect();
-            candidates.sort_by(|a, b| {
-                let count_cmp = b.1.cmp(&a.1);
-                if count_cmp == Ordering::Equal {
-                    a.0.cmp(&b.0)
-                } else {
-                    count_cmp
+            let mut best_count = 0usize;
+            for (pixel, count) in counts {
+                if count > best_count || (count == best_count && pixel < best_pixel) {
+                    best_count = count;
+                    best_pixel = pixel;
                 }
-            });
-
-            if let Some(winner) = candidates.first() {
-                best_pixel = winner.0;
             }
 
             final_img.put_pixel(x_i as u32, y_i as u32, Rgba(best_pixel));
@@ -1438,6 +1235,8 @@ mod cli_tests {
             "8",
             "--palette",
             "0d2b45,ffecd6",
+            "--report",
+            "report.json",
         ]))
         .unwrap();
 
@@ -1450,6 +1249,7 @@ mod cli_tests {
         assert_eq!(config.k_colors, 24);
         assert_eq!(config.pixel_size_override, Some(8.0));
         assert_eq!(config.palette, Some(vec![[13, 43, 69], [255, 236, 214]]));
+        assert_eq!(config.report_path.as_deref(), Some("report.json"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 /target
 /samples
 /pkg
+/artifacts/matrix
 .DS_Store

@@ -10,12 +10,28 @@ readme = "README.md"
 keywords = ["pixel-art", "image-processing", "cli", "wasm", "gamedev"]
 categories = ["command-line-utilities", "multimedia::images"]
 
+# Targets are declared explicitly so the matrix runner's source directory is
+# not also picked up as an integration test.
+autotests = false
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "spritefusion-pixel-snapper"
 path = "src/main.rs"
+
+# Deterministic matrix runner: regenerates synthetic patterns and writes the
+# detection matrix report. Not part of the published CLI surface.
+[[bin]]
+name = "matrix-runner"
+path = "tests/matrix_runner/main.rs"
+test = false
+bench = false
+
+[[test]]
+name = "matrix"
+path = "tests/matrix.rs"
 
 [dependencies]
 image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }

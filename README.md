@@ -64,6 +64,7 @@ spritefusion-pixel-snapper <INPUT> <OUTPUT> [COLOR_COUNT] [OPTIONS]
 - `[COLOR_COUNT]`: Number of palette colors. Defaults to `16`.
 - `--pixel-size <PIXELS>`: Overrides the auto-detected pixel size. The value must be between 1 and half the smallest image dimension.
 - `--palette <HEX,...>`: Constrains the output to comma-separated six-digit hex colors.
+- `--report <FILE>`: Writes a deterministic JSON detection report (verdict, pitch, confidence, scale, ranked candidates and output SHA-256).
 
 Examples:
 
@@ -81,9 +82,67 @@ spritefusion-pixel-snapper sprites/batch_inputs sprites/batch_outputs 16 --pixel
 # Use a fixed color palette
 spritefusion-pixel-snapper input.png output.png --palette "0d2b45,203c56,544e68,8d697a,d08159,ffaa5e,ffd4a3,ffecd6"
 spritefusion-pixel-snapper sprites/batch_inputs sprites/batch_outputs --palette "0d2b45,203c56,544e68,8d697a"
+
+# Emit the machine-readable detection report
+spritefusion-pixel-snapper input.png output.png --report report.json
 ```
 
 Run `spritefusion-pixel-snapper --help` to see every option.
+
+### How grid detection works
+
+Detection runs as a single deterministic pipeline — the same input always
+produces the same pitch, confidence and output bytes:
+
+1. **Profiles.** A `[-1, 0, 1]` gradient is projected onto each axis
+   (transparent pixels count as luma 0), producing column and row edge
+   profiles.
+2. **Scoring.** Every candidate pitch is scored by the normalized
+   autocorrelation of the mean-subtracted profile — a pitch-unbiased measure
+   of periodicity. A harmonic-decay term favors the base pitch, and short
+   lags inherited from smooth ramps are penalized.
+3. **Candidate pruning.** Harmonic and near-equivalent pitches are grouped;
+   the base pitch represents each group unless another member wins
+   decisively. Ties always resolve to the smaller pitch, and the ranked list
+   is capped at eight candidates.
+4. **Confidence and no-grid gate.** A confidence in `[0, 1]` combines the
+   winning score, the margin over the runner-up and the profile signal.
+   Inputs that fail the score/margin/signal gates are reported as
+   `no_grid` and pass through unchanged (identity transform) instead of
+   being snapped to a fabricated grid.
+5. **Transform.** The winning pitch drives deterministic uniform cut lines,
+   and each cell is reduced to one output pixel by majority vote with
+   lexicographic tie-breaking (never hash-map iteration order).
+
+The `--report` JSON makes every step auditable:
+
+```json
+{
+  "verdict": "detected",
+  "input_size": [128, 96],
+  "output_size": [16, 12],
+  "scale": [0.125, 0.125],
+  "pitch": 8,
+  "confidence": 1.0,
+  "margin": 0.644,
+  "output_sha256": "7e7782f0...",
+  "candidates": [ {"pitch": 8, "score": 0.876, "...": "..."} ]
+}
+```
+
+### Deterministic test matrix
+
+A fixed-seed matrix covers the hard cases — blur, low contrast, transparent
+edges, 45-degree edges and per-pixel noise — together with two no-grid
+controls (a smooth gradient and random noise) and the repository images.
+Each case records the verdict, best pitch/ratio, confidence, output scale and
+SHA-256 hash; regenerating the matrix yields byte-identical artifacts:
+
+```bash
+cargo test
+cargo run --release --bin matrix-runner -- artifacts/matrix
+```
+
 
 ### Build from source
 
